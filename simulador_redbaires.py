@@ -121,7 +121,7 @@ class Informe:
     configuracion: dict
     escenario: str
     semilla: int
-    # variables de referencia
+    # variables de referencia (totales de la ventana de medición)
     IN: float
     IL: float
     CFP: float
@@ -147,12 +147,13 @@ class Informe:
     casos_por_min: float
     tamano_medio_cascada: float          # piezas sembradas y terminadas dentro de la ventana de medición
     duracion_media_cascada_h: float
-    # costos (USD por mes)
+    # costos (USD por mes; lo medido en la ventana se lleva a un mes de horas_operativas_mes)
     CF_moderadores: float
     CF_clasificador: float
     CF_degradacion: float
     CF: float
-    CD: float
+    CFP_mes: float
+    CD: float                            # CF + CFP_mes
     valor_impresiones_legitimas: float
     costo_social_impresiones_nocivas: float
     # cómputo
@@ -164,7 +165,7 @@ class Informe:
                  ('UM medio (%)', self.UM_medio_pct), ('QM medio', self.QM_medio), ('PA medio', self.PA_medio),
                  ('Reenvíos', self.reenvios), ('Casos revisados', self.casos_revisados),
                  ('Remociones nocivas', self.remociones_nocivas), ('Remociones legítimas', self.remociones_legitimas),
-                 ('CF (USD/mes)', self.CF), ('CD = CF + CFP (USD/mes)', self.CD)]
+                 ('CF (USD/mes)', self.CF), ('CD = CF + CFP mensual (USD/mes)', self.CD)]
         return pd.DataFrame(filas, columns=['indicador', 'valor']).set_index('indicador')
 
 
@@ -190,6 +191,13 @@ class SimuladorRedBaires:
     @staticmethod
     def _elegir(rng, cum):
         return min(bisect_right(cum, rng.random() * cum[-1]), len(cum) - 1)
+
+    def parametros_fila(self, sup):
+        """(TREV, DER) en minutos con los supuestos dados. No depende de corridas anteriores."""
+        fz = self.I.finanzas
+        trev = sup.trev_media_min if sup.trev_media_min else fz['costo_revision_por_item_flag']['base'] / fz['costo_moderador_por_hora']['base'] * 60
+        der = sup.derivacion_min if sup.derivacion_min is not None else self.I.piso_latencia
+        return trev, der
 
     def _preparar(self, cfg, esc, sup):
         """Fija los parámetros derivados de una corrida."""
@@ -222,8 +230,7 @@ class SimuladorRedBaires:
         self.fdeg = 1.0 - cfg.delta
         self.ln_fdeg = math.log(self.fdeg)
         # moderación
-        self.trev = sup.trev_media_min if sup.trev_media_min else fz['costo_revision_por_item_flag']['base'] / fz['costo_moderador_por_hora']['base'] * 60
-        self.der = sup.derivacion_min if sup.derivacion_min is not None else I.piso_latencia
+        self.trev, self.der = self.parametros_fila(sup)
         self.escala = sup.escala if sup.escala else I.escala
         self.ndeg = sup.ndeg if sup.ndeg is not None else I.ndeg
 
@@ -576,6 +583,7 @@ class SimuladorRedBaires:
         dias_mes = fz['horas_operativas_mes']['base'] / 24                       # 30 días
         cf_deg = (fz['costo_degradar_influencer_por_dia']['base'] * self.ndeg * dias_mes) if (self.deg_mega and cfg.delta > 0) else 0.0
         CF = cf_mod + cf_cla + cf_deg
+        a_mes = fz['horas_operativas_mes']['base'] / sup.horizonte_h               # 1 con el horizonte de 30 días
         return Informe(
             configuracion=asdict(cfg), escenario=esc.nombre, semilla=semilla,
             IN=IN, IL=IL, CFP=CFP,
@@ -590,9 +598,9 @@ class SimuladorRedBaires:
             casos_por_min=cont['casos'] / (t_fin - t_ini),
             tamano_medio_cascada=float(np.mean([c[0] for c in cascadas])) if cascadas else float('nan'),
             duracion_media_cascada_h=float(np.mean([c[1] for c in cascadas])) if cascadas else float('nan'),
-            CF_moderadores=cf_mod, CF_clasificador=cf_cla, CF_degradacion=cf_deg, CF=CF, CD=CF + CFP,
-            valor_impresiones_legitimas=IL * fz['valor_engagement_por_impresion']['base'],
-            costo_social_impresiones_nocivas=IN * fz['costo_social_por_impresion_nociva']['base'],
+            CF_moderadores=cf_mod, CF_clasificador=cf_cla, CF_degradacion=cf_deg, CF=CF, CFP_mes=CFP * a_mes, CD=CF + CFP * a_mes,
+            valor_impresiones_legitimas=IL * a_mes * fz['valor_engagement_por_impresion']['base'],
+            costo_social_impresiones_nocivas=IN * a_mes * fz['costo_social_por_impresion_nociva']['base'],
             eventos_procesados=cont['eventos'], segundos=time.perf_counter() - reloj0), (
             {'estado': pd.DataFrame(serie, columns=['t_min', 'QM', 'BM', 'PA']).assign(UM=lambda v: 100 * v.BM / cfg.M),
              'R': pd.DataFrame(serie_R, columns=['t_min', 'pieza', 'R'])} if series else None)
@@ -617,28 +625,41 @@ def calibrar_escala(sim, n=100_000, semilla=7, retardo='mezcla'):
 # =====================================================================================
 # Réplicas e intervalos de confianza
 # =====================================================================================
-_SIM = None
+_SIM = None                      # copia del simulador en cada proceso de trabajo
 
 
-def _trabajo(args):
-    cfg, escenario, sup, semilla = args
-    inf, _ = _SIM.correr(cfg, escenario, sup, semilla)
-    return asdict(inf)
+def _iniciar(sim):
+    global _SIM
+    _SIM = sim
+
+
+def _llamar(args):
+    funcion, tarea = args
+    return funcion(_SIM, tarea)
+
+
+def en_paralelo(sim, funcion, tareas, procesos=1):
+    """Devuelve [funcion(sim, tarea) for tarea in tareas], repartido en procesos si procesos > 1.
+    Cada proceso recibe una copia del simulador al iniciar. Usa el método de inicio del sistema
+    (spawn en Windows), así que funcion tiene que estar definida en un módulo y no en el cuaderno."""
+    if procesos <= 1:
+        return [funcion(sim, t) for t in tareas]
+    import multiprocessing as mp
+    with mp.Pool(procesos, initializer=_iniciar, initargs=(sim,)) as pool:
+        return pool.map(_llamar, [(funcion, t) for t in tareas])
+
+
+def correr_tarea(sim, tarea):
+    """Una réplica de la tarea (cfg, escenario, sup, semilla). Devuelve el informe."""
+    cfg, escenario, sup, semilla = tarea
+    return sim.correr(cfg, escenario, sup, semilla)[0]
 
 
 def replicar(sim, cfg=None, escenario='conservador', sup=None, n=10, semilla_base=1, procesos=1):
     """Corre n réplicas independientes (semillas semilla_base, ..., semilla_base + n - 1).
     Con la misma semilla_base, dos configuraciones usan números aleatorios comunes."""
-    global _SIM
-    _SIM = sim
     tareas = [(cfg or Configuracion(), escenario, sup or Supuestos(), semilla_base + i) for i in range(n)]
-    if procesos > 1:
-        import multiprocessing as mp
-        with mp.get_context('fork').Pool(procesos) as pool:
-            res = pool.map(_trabajo, tareas)
-    else:
-        res = [_trabajo(t) for t in tareas]
-    return pd.DataFrame(res)
+    return pd.DataFrame([asdict(inf) for inf in en_paralelo(sim, correr_tarea, tareas, procesos)])
 
 
 def intervalo(x, nivel=0.95):

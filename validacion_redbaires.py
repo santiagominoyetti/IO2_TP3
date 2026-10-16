@@ -10,12 +10,10 @@ Prueba de bondad de ajuste por Monte Carlo (bootstrap paramétrico):
 Estadísticos: chi cuadrado por intervalos para el tamaño y la profundidad, Kolmogorov-Smirnov para la
 duración y diferencia absoluta de proporciones para la fracción de piezas marcadas.
 """
-import multiprocessing as mp
-
 import numpy as np
 import pandas as pd
 
-from simulador_redbaires import Supuestos
+from simulador_redbaires import Supuestos, en_paralelo
 
 INTERVALOS = {
     'tamano': [1, 2, 3, 4, 6, 11, 21, 51, 101, 500, 10 ** 9],
@@ -26,22 +24,13 @@ ETIQUETAS = {
     'profundidad': ['0', '1', '2', '3', '4', '5', '6-7', '8-10', '11 o más'],
 }
 
-_SIM = None
-
-
-def _lote(args):
-    semilla, n, tope, retardo = args
-    return _SIM.simular_cascadas(n, semilla=semilla, tope=tope, sup=Supuestos(retardo=retardo))
+def _lote(sim, tarea):
+    semilla, n, tope, retardo = tarea
+    return sim.simular_cascadas(n, semilla=semilla, tope=tope, sup=Supuestos(retardo=retardo))
 
 
 def simular_lotes(sim, semillas, n, tope, retardo, procesos=2):
-    global _SIM
-    _SIM = sim
-    tareas = [(s, n, tope, retardo) for s in semillas]
-    if procesos > 1:
-        with mp.get_context('fork').Pool(procesos) as pool:
-            return pool.map(_lote, tareas)
-    return [_lote(t) for t in tareas]
+    return en_paralelo(sim, _lote, [(s, n, tope, retardo) for s in semillas], procesos)
 
 
 def _chi2(x, p, bins):

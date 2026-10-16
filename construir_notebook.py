@@ -43,7 +43,7 @@ El simulador se reparte en tres módulos:
 | Módulo | Contenido |
 |---|---|
 | `insumos_redbaires.py` | Lectura y limpieza de los datos; estimación de cada parámetro de entrada (`estimar_insumos`). Devuelve un objeto `Insumos`. |
-| `simulador_redbaires.py` | Clases `Configuracion` (variables de decisión), `Escenario`, `Supuestos` (cantidades sin datos y parámetros de la réplica), `SimuladorRedBaires` (eventos E1 a E4 y lógicas L1 a L4), `Informe` (variables de referencia, variables de estado promedio, indicadores y costos) y funciones `replicar`, `intervalo`, `informe_replicas` y `calibrar_escala`. |
+| `simulador_redbaires.py` | Clases `Configuracion` (variables de decisión), `Escenario`, `Supuestos` (cantidades sin datos y parámetros de la réplica), `SimuladorRedBaires` (eventos E1 a E4 y lógicas L1 a L4), `Informe` (variables de referencia, variables de estado promedio, indicadores y costos) y funciones `replicar`, `en_paralelo`, `intervalo`, `informe_replicas` y `calibrar_escala`. |
 | `validacion_redbaires.py` | Prueba de bondad de ajuste por Monte Carlo entre las cascadas simuladas y las observadas. |
 
 Una corrida se pide con una configuración de las seis variables de decisión; el resultado es un informe:
@@ -65,7 +65,7 @@ import numpy as np, pandas as pd, scipy.stats as st
 import matplotlib.pyplot as plt
 from insumos_redbaires import estimar_insumos, Insumos, NIVELES
 from simulador_redbaires import (SimuladorRedBaires, Configuracion, Supuestos, Escenario, ESCENARIOS,
-                                 replicar, intervalo, informe_replicas, calibrar_escala)
+                                 replicar, intervalo, informe_replicas, calibrar_escala, en_paralelo, correr_tarea)
 from validacion_redbaires import prueba_bondad, INTERVALOS, ETIQUETAS
 def n(x, d=4):
     # número con formato es-AR: punto de miles y coma decimal
@@ -77,14 +77,19 @@ PROCESOS = 2
 t_inicio_cuaderno = time.time()
 
 # Las corridas largas se guardan en disco al terminar, solo para poder retomar la ejecución si se interrumpe.
-# La carpeta lleva un resumen (hash) del código de los tres módulos: si el código cambia, todo se recalcula.
+# La carpeta lleva un resumen (hash) del código de los tres módulos y de los datos: si cambian, todo se recalcula.
+# Cada archivo lleva además un resumen de los parámetros de su corrida: si cambian, esa corrida se recalcula.
 import os, hashlib
-_codigo = b''.join(open(m, 'rb').read() for m in ['insumos_redbaires.py', 'simulador_redbaires.py', 'validacion_redbaires.py'])
+_codigo = b''
+for m in ['insumos_redbaires.py', 'simulador_redbaires.py', 'validacion_redbaires.py', 'TP3_datos.zip']:
+    with open(m, 'rb') as f:
+        _codigo += f.read()
 CACHE = os.path.join('resultados_corridas', hashlib.sha256(_codigo).hexdigest()[:12])
 os.makedirs(CACHE, exist_ok=True)
-print('Carpeta de resultados de esta versión del código:', CACHE)
-def en_disco(nombre, funcion):
-    ruta = os.path.join(CACHE, nombre + '.pkl')
+print('Carpeta de resultados de esta versión del código y los datos:', CACHE)
+def en_disco(nombre, funcion, **parametros):
+    clave = hashlib.sha256(repr(sorted(parametros.items())).encode()).hexdigest()[:8]
+    ruta = os.path.join(CACHE, f'{nombre}_{clave}.pkl')
     if os.path.exists(ruta):
         with open(ruta, 'rb') as f:
             return pickle.load(f)
@@ -92,6 +97,10 @@ def en_disco(nombre, funcion):
     with open(ruta, 'wb') as f:
         pickle.dump(r, f)
     return r
+def replicas(nombre, cfg, escenario, sup, n, semilla_base=1):
+    # réplicas guardadas en disco; la clave incluye todo lo que define la corrida
+    return en_disco(nombre, lambda: replicar(sim, cfg, escenario, sup, n=n, semilla_base=semilla_base, procesos=PROCESOS),
+                    cfg=cfg, escenario=escenario, sup=sup, n=n, semilla_base=semilla_base)
 """)
 
 md(r"""
@@ -188,7 +197,8 @@ R_BOOT = 300
 validacion = {}
 for ret in ['h2', 'h2_espera', 'mezcla']:
     t0 = time.time()
-    tabla, comparacion, ref = en_disco(f'validacion_{ret}', lambda: prueba_bondad(sim, I.observado, retardo=ret, n_ref=200_000, R=R_BOOT, semilla=1, procesos=PROCESOS))
+    par = dict(retardo=ret, n_ref=200_000, R=R_BOOT, semilla=1)
+    tabla, comparacion, ref = en_disco('validacion', lambda: prueba_bondad(sim, I.observado, procesos=PROCESOS, **par), **par)
     validacion[ret] = dict(tabla=tabla, comparacion=comparacion, ref=ref)
     print(f'Retardo {ret} ({n(time.time() - t0, 0)} s, R = {R_BOOT} muestras simuladas)')
     print(tabla.to_string(), '\n')
@@ -280,7 +290,8 @@ La parte A calibró ESC para que los casos lleguen a la fila con la tasa λ que 
 """)
 
 code(r"""
-ESC_B, p_marcada_sim = en_disco('escala', lambda: calibrar_escala(sim, n=100_000, semilla=7, retardo='mezcla'))
+par = dict(n=100_000, semilla=7, retardo='mezcla')
+ESC_B, p_marcada_sim = en_disco('escala', lambda: calibrar_escala(sim, **par), **par)
 lam, mu = I.observado['lambda_casos_min'], I.observado['mu_casos_min']
 lam_A = I.escala * I.semillas_por_dia * p_marcada_sim / 1440
 print(f'λ calibrada en la parte A: {n(lam, 4)} casos/min; μ = {n(mu, 4)} casos/min')
@@ -308,19 +319,13 @@ def mmc(lam, mu, c):
     lq = p0 * a ** c * rho / (math.factorial(c) * (1 - rho) ** 2)
     return dict(rho=rho, Lq=lq, Wq=lq / lam)
 
-def _verif(M):
-    s = Supuestos(retardo='mezcla', escala=ESC_B, llegadas_uniformes=True)
-    inf, _ = sim.correr(Configuracion(M=M), 'conservador', s, semilla=11)
-    return inf
-
-import multiprocessing as mp
-def _verificar():
-    with mp.get_context('fork').Pool(PROCESOS) as pool:
-        return pool.map(_verif, [2, 3])
-verif = en_disco('verificacion_mmc', _verificar)
+s_mmc = Supuestos(retardo='mezcla', escala=ESC_B, llegadas_uniformes=True)
+tareas_mmc = [(Configuracion(M=M), 'conservador', s_mmc, 11) for M in (2, 3)]
+verif = en_disco('verificacion_mmc', lambda: en_paralelo(sim, correr_tarea, tareas_mmc, PROCESOS), tareas=tareas_mmc)
+trev, _ = sim.parametros_fila(s_mmc)
 filas = []
 for inf in verif:
-    M = inf.configuracion['M']; teo = mmc(inf.casos_por_min, 1 / sim.trev, M)
+    M = inf.configuracion['M']; teo = mmc(inf.casos_por_min, 1 / trev, M)
     filas.append({'M': M, 'λ medida (casos/min)': inf.casos_por_min, 'ρ teórica': teo['rho'], 'UM simulada / 100': inf.UM_medio_pct / 100,
                   'Lq teórica': teo['Lq'], 'QM media simulada': inf.QM_medio, 'Wq teórica (min)': teo['Wq'], 'Wq simulada (min)': inf.espera_media_fila_min})
 tab_mmc = pd.DataFrame(filas).set_index('M')
@@ -369,7 +374,7 @@ prueba('C = 2 crea más casos de piezas nocivas y menos de legítimas que C = 0'
        c2.casos_nocivos > base.casos_nocivos and c2.casos_creados - c2.casos_nocivos < base.casos_creados - base.casos_nocivos)
 m12 = corrida(M=12)
 prueba('Con M = 12 la espera en fila es casi nula', m12.espera_media_fila_min < 0.1)
-prueba('Con M = 12 la latencia es DER + TREV aproximadamente', abs(m12.latencia_media_min - (sim.der + sim.trev)) < 1)
+prueba('Con M = 12 la latencia es DER + TREV aproximadamente', abs(m12.latencia_media_min - sum(sim.parametros_fila(SUP_CORTO))) < 1)
 prueba('Más moderadores no aumentan IN', m12.IN <= base.IN)
 # Sin moderación efectiva (PREM = 0) la moderación no altera la propagación
 s0 = Supuestos(retardo='mezcla', escala=ESC_B, horizonte_h=48, prem_nociva=0.0, prem_legitima=0.0)
@@ -427,7 +432,7 @@ code(r"""
 CFG0 = Configuracion()          # situación actual: M = 1, C = 0, sin fricción ni degradación
 N0 = 10
 t0 = time.time()
-piloto = en_disco('piloto', lambda: replicar(sim, CFG0, 'conservador', SUP, n=N0, semilla_base=1, procesos=PROCESOS))
+piloto = replicas('piloto', CFG0, 'conservador', SUP, n=N0)
 print(f'{N0} réplicas piloto en {n(time.time() - t0, 0)} s')
 eps = 0.05
 filas = []
@@ -449,7 +454,7 @@ Se completan N réplicas de la situación actual (las piloto más las que faltan
 
 code(r"""
 t0 = time.time()
-resto = en_disco(f'resto_{N}', lambda: replicar(sim, CFG0, 'conservador', SUP, n=N - N0, semilla_base=N0 + 1, procesos=PROCESOS)) if N > N0 else piloto.iloc[:0]
+resto = replicas('resto', CFG0, 'conservador', SUP, n=N - N0, semilla_base=N0 + 1) if N > N0 else piloto.iloc[:0]
 base_N = pd.concat([piloto, resto], ignore_index=True)
 print(f'{len(base_N)} réplicas ({n(time.time() - t0, 0)} s adicionales)')
 variables = ['IN', 'IL', 'CFP', 'QM_medio', 'BM_medio', 'UM_medio_pct', 'PA_medio', 'reenvios', 'casos_revisados',
@@ -474,10 +479,7 @@ md(r"""
 """)
 
 code(r"""
-def _uniforme():
-    s = Supuestos(retardo='mezcla', escala=ESC_B, llegadas_uniformes=True)
-    return replicar(sim, CFG0, 'conservador', s, n=2, semilla_base=1, procesos=PROCESOS)
-unif = en_disco('latencia_uniforme', _uniforme)
+unif = replicas('latencia_uniforme', CFG0, 'conservador', Supuestos(retardo='mezcla', escala=ESC_B, llegadas_uniformes=True), n=2)
 comp_lat = pd.DataFrame({
     'observada (muestra)': [np.nan, lat_obs.mean()],
     'simulada, siembra por día y hora': [base_N.espera_media_fila_min.mean(), base_N.latencia_media_min.mean()],
@@ -514,7 +516,7 @@ estres = {
 res_estres = {}
 t0 = time.time()
 for nombre, (cfg, esc) in estres.items():
-    res_estres[nombre] = en_disco('estres_' + str(list(estres).index(nombre)), lambda: replicar(sim, cfg, esc, SUP7, n=3, semilla_base=1, procesos=PROCESOS))
+    res_estres[nombre] = replicas('estres', cfg, esc, SUP7, n=3)
 print(f'Prueba de estrés: {n(time.time() - t0, 0)} s')
 cols = ['IN', 'IL', 'CFP', 'UM_medio_pct', 'QM_medio', 'PA_medio', 'reenvios_bloqueados', 'remociones_nocivas', 'remociones_legitimas', 'espera_media_fila_min', 'CF', 'segundos']
 tab_estres = pd.DataFrame({k: v[cols].mean() for k, v in res_estres.items()}).T

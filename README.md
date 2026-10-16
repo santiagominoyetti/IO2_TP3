@@ -49,6 +49,10 @@ tabla = replicar(sim, Configuracion(M=2), 'conservador', sup, n=10, semilla_base
 print(informe_replicas(tabla))
 ```
 
+Con `procesos > 1` las réplicas se reparten en procesos con el método de inicio del sistema (en Windows, spawn). Si el código anterior se corre como script, y no desde el cuaderno, tiene que ir bajo `if __name__ == '__main__':`.
+
+IN, IL y CFP son totales de la ventana de medición. Los costos del informe (CF, `CFP_mes`, CD) están en USD por mes: con un horizonte distinto de 30 días, lo medido se lleva a un mes antes de sumarlo a CF.
+
 Variables de decisión (`Configuracion`):
 
 | VD | Significado | Rango |
@@ -64,14 +68,17 @@ Escenarios: `'conservador'`, `'intermedio'` y `'pesimista'`. Los supuestos sin d
 
 Dos corridas con la misma semilla dan el mismo informe. Dos configuraciones corridas con la misma `semilla_base` comparten números aleatorios.
 
-Para volver a ejecutar el notebook completo (unos 35 minutos con 2 núcleos):
+Para volver a ejecutar el notebook completo y su versión HTML (entre 35 y 60 minutos con 2 núcleos, según la máquina), con el entorno activado:
 
 ```bash
 python construir_notebook.py
-jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1 TP3_simulador_RedBaires.ipynb --output TP3_simulador_RedBaires.ipynb
+python -m nbconvert --to notebook --execute --ExecutePreprocessor.timeout=-1 TP3_simulador_RedBaires.ipynb --output TP3_simulador_RedBaires.ipynb
+python -m nbconvert --to html TP3_simulador_RedBaires.ipynb
 ```
 
-Las corridas largas se guardan en `resultados_corridas/`, en una subcarpeta identificada por el código de los módulos. Si la ejecución se interrumpe, retoma desde lo guardado; si el código cambia, recalcula todo. Esa carpeta no se sube al repositorio.
+`python -m nbconvert` asegura que el cuaderno corra con el Python del entorno, aunque haya otro Jupyter instalado en el sistema.
+
+Las corridas largas se guardan en `resultados_corridas/`, en una subcarpeta identificada por el código de los módulos y los datos, y cada archivo lleva además un resumen de los parámetros de su corrida. Si la ejecución se interrumpe, retoma desde lo guardado; si el código o los datos cambian, recalcula todo, y si cambian los parámetros de una corrida, recalcula esa corrida. Esa carpeta no se sube al repositorio.
 
 ## Estado
 
